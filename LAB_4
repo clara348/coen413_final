@@ -1,0 +1,673 @@
+//////////////// APB ENV /////////////
+
+/******************** apb_gen *****************************************************
+ * Basic Transaction Generator aimed at randomizing and
+ * initiating read() and write() transactions based
+ * on APB BFM (apb_master)
+`include "apb_env/apb_trans.sv"
+
+class apb_gen;
+
+  // Random APB transaction
+  rand apb_trans rand_tr;
+
+  // Test terminates when the trans_cnt is greater
+  // than max_trans_cnt member
+  int max_trans_cnt;
+  
+  // event notifying that all transactions were sent
+  event ended;
+  
+  // Counts the number of performed transactions
+  int trans_cnt = 0;
+
+  // Verbosity level
+  bit verbose;
+  
+  // APB Transaction mailbox
+  mailbox #(apb_trans) gen2mas;
+    
+  // Constructor
+  function new(mailbox #(apb_trans) gen2mas, int max_trans_cnt, bit verbose=0);
+    this.gen2mas       = gen2mas;
+    this.verbose       = verbose;
+    this.max_trans_cnt = max_trans_cnt;
+    rand_tr            = new;
+  endfunction
+
+  // Method aimed at generating transactions
+  task main();
+    if(verbose)
+      $display($time, ": Starting apb_gen for %0d transactions", 
+               max_trans_cnt);
+    
+    // Start this daemon as long as there is a transaction 
+    // to be proceeded)
+    while(!end_of_test())
+      begin
+        apb_trans my_tr;
+        
+        // Wait & Get a transaction
+        my_tr = get_transaction();
+  
+        // Increment the number of sent transactions
+        if(my_tr.transaction != IDLE)
+          ++trans_cnt;
+  
+        if(verbose)
+          my_tr.display("Generator");
+
+        gen2mas.put(my_tr);
+      end // while (!end_of_test())
+        
+    if(verbose) 
+      $display($time, ": Ending apb_gen\n");
+  
+    ->ended;
+
+  endtask
+
+
+  // Returns TRUE when the test should stop
+  virtual function bit end_of_test();
+    end_of_test = (trans_cnt >= max_trans_cnt);
+  endfunction
+    
+  // Returns a transaction (associated with tr member)
+  virtual function apb_trans get_transaction();
+    rand_tr.trans_cnt = trans_cnt;
+    if (! this.rand_tr.randomize())
+      begin
+        $display("apb_gen::randomize failed");
+        $finish;
+      end
+    return rand_tr.copy();
+  endfunction
+    
+endclass
+
+/************************** APB interface ************************************************
+`ifndef APB_IF_DEFINE
+`define APB_IF_DEFINE
+
+`include "hdl/root.sv"
+
+interface apb_if(input PClk);
+  logic [APB_ADDR_WIDTH-1:0]  PAddr;
+  logic PSel;
+  logic [APB_DATA_WIDTH-1:0]  PWData;
+  logic [APB_DATA_WIDTH-1:0]  PRData;
+  logic PEnable;
+  logic PWrite;
+  logic Rst;
+
+  clocking master_cb @(posedge PClk);
+    default input #1 output #1;
+    output  PAddr;
+    output  PSel;
+    output  PWData;
+    input   PRData;
+    output  PEnable;
+    output  PWrite;
+    output  Rst; 
+  endclocking
+
+  clocking monitor_cb @(posedge PClk);
+    // default input #1skew output #0;
+    input  PAddr;
+    input  PSel;
+    input  PWData;
+    input  PRData;
+    input  PEnable;
+    input  PWrite;
+    input  Rst; 
+  endclocking
+
+  modport Master(clocking master_cb);
+  modport Monitor(clocking monitor_cb);
+
+  modport Slave(input PAddr, PClk, PSel, PWData, PEnable, PWrite, Rst,
+                output PRData);
+
+endinterface
+
+`endif    
+
+/************************ apb_master *******************************************
+ 
+`define APB_MASTER_IF	apb_master_if.master_cb
+`include "apb_env/apb_trans.sv"
+
+  
+class apb_master;
+
+    // APB Interface (Master side)
+    virtual apb_if.Master apb_master_if;
+
+    // APB Transaction mailboxes
+    mailbox #(apb_trans) gen2mas, mas2scb;
+
+    // Verbosity level
+    bit verbose;
+  
+    // Constructor
+    function new(virtual apb_if.Master apb_master_if, 
+                 mailbox #(apb_trans) gen2mas, mas2scb,
+                 bit verbose=0);
+
+      this.gen2mas       = gen2mas;
+      this.mas2scb       = mas2scb;    
+      this.apb_master_if = apb_master_if;
+      this.verbose       = verbose;
+    endfunction: new
+    
+    // Main daemon. Runs forever to switch APB transaction to
+    // corresponding read/write/idle command
+    task main();
+       apb_trans tr;
+
+       if(verbose)
+         $display($time, ": Starting apb_master");
+
+       forever begin
+        // Wait & get a transaction
+        gen2mas.get(tr);
+  
+        // Decide what to do now with the incoming transaction
+        case (tr.transaction)
+          // Read cycle
+          READ:
+            read(tr);
+
+          // Write cycle
+          WRITE:
+            write(tr);
+
+          // Idle cycle
+          default:
+            idle();
+        endcase
+
+        if(verbose)
+          tr.display("Master");
+      end
+
+       if(verbose)
+         $display($time, ": Ending apb_master");
+
+    endtask: main
+
+
+    // Reset the DUT then go to active mode
+    task reset();
+      `APB_MASTER_IF.Rst <= 0;
+      idle();
+      #5 `APB_MASTER_IF.Rst <= 1;
+   endtask: reset
+
+
+    // Put the APB Bus in idle mode
+    task idle();
+      `APB_MASTER_IF.PAddr   <= 0;
+      `APB_MASTER_IF.PSel    <= 0;
+      `APB_MASTER_IF.PWData  <= 0;
+      `APB_MASTER_IF.PEnable <= 0;
+      `APB_MASTER_IF.PWrite  <= 0;
+      #1 `APB_MASTER_IF.PWrite  <= 0;
+   endtask: idle
+
+
+   // Implementation of the read() method
+   //    - drives the address bus,
+   //    - select the  bus,
+   //    - assert Penable signal,
+   //    - read the data and return it.
+   task read(apb_trans tr);
+     // Drive Control bus
+     `APB_MASTER_IF.PAddr  <= tr.addr;
+     `APB_MASTER_IF.PWrite <= 1'b0;
+     `APB_MASTER_IF.PSel   <= 1'b1;
+
+     // Assert Penable
+     #1 `APB_MASTER_IF.PEnable <= 1'b1;
+
+     // Deassert Penable & return the read data
+     #1 `APB_MASTER_IF.PEnable <= 1'b0;
+     tr.data = `APB_MASTER_IF.PRData;
+     mas2scb.put(tr);
+  endtask: read
+        
+
+  // Perform a write cycle
+   //    - Drive the address bus,
+   //    - Select the  bus,
+   //    - Drive data bus
+   //    - Assert Penable signal,
+  task  write(apb_trans tr);
+     // Drive Control bus
+     `APB_MASTER_IF.PAddr  <= tr.addr;
+     `APB_MASTER_IF.PWData <= tr.data;
+     `APB_MASTER_IF.PWrite <= 1'b1;
+     `APB_MASTER_IF.PSel   <= 1'b1;
+
+     // Assert Penable
+     #1 `APB_MASTER_IF.PEnable <= 1'b1;
+
+     // Deassert it
+     #1 `APB_MASTER_IF.PEnable <= 1'b0;
+     mas2scb.put(tr);
+  endtask: write
+
+endclass: apb_master
+
+/*********************** Monitoring *********************************************
+`define APB_MONITOR_IF	apb_monitor_if.monitor_cb
+`include "apb_env/apb_trans.sv"
+
+
+class apb_monitor;
+
+  bit verbose;
+  
+  // Data member in charge of holding monitored transaction
+  apb_trans tr;
+
+  // APB Interface (Monitor side)
+  virtual apb_if.Monitor apb_monitor_if;
+
+  // Monitor to scoreboard mailbox
+  mailbox #(apb_trans) mon2scb;
+
+    
+  function new(virtual apb_if.Monitor apb_monitor_if, mailbox #(apb_trans) mon2scb, bit verbose=0);
+    this.apb_monitor_if = apb_monitor_if;
+    this.verbose = verbose;
+    this.mon2scb = mon2scb;
+  endfunction: new
+
+  task main();
+bit Sel;
+    forever begin
+
+      // Wait for the device to be selected
+      Sel = `APB_MONITOR_IF.PSel;
+      if(Sel === 0) 
+         @(posedge `APB_MONITOR_IF.PSel);
+	#100;
+      // Wait for latch enable
+      @(posedge `APB_MONITOR_IF.PEnable);
+
+      // Read/Write cycle decision
+      this.tr = new;
+
+      if(`APB_MONITOR_IF.PWrite) 
+      begin
+        // Store current transaction parameters 
+        tr.transaction = WRITE;
+        tr.data = `APB_MONITOR_IF.PWData;
+        tr.addr = `APB_MONITOR_IF.PAddr;
+      end
+      else 
+      begin
+        // Read cycle
+        // Store current transaction parameters 
+        tr.transaction = READ;
+        tr.data = `APB_MONITOR_IF.PRData;
+        tr.addr = `APB_MONITOR_IF.PAddr;
+      end
+      
+      // Pass the transaction to the scoreboard
+      mon2scb.put(tr);
+      
+      if(verbose)
+        tr.display("Monitor");
+
+    end // forever
+  endtask: main
+
+endclass: apb_monitor
+
+
+/*************************** apb_trans *********************************************
+`ifndef APB_IF_DEFINE
+`define APB_IF_DEFINE
+
+`include "hdl/root.sv"
+
+class apb_trans;
+    rand apb_addr_t addr;
+    rand apb_data_t data;
+    rand trans_e                 transaction;
+    static int count=0;
+    int id, trans_cnt;
+
+    function new;
+    id = count++;
+    endfunction
+
+
+    function void display(string prefix);
+        case (this.transaction)
+          READ:
+            $display($time, ": %s Read  Addr=0x%02X Data=0x%02X id=%0d",
+                   prefix, addr, data, id);
+          WRITE:
+            $display($time, ": %s Write Addr=0x%02X Data=0x%02X id=%0d",
+                   prefix, addr, data, id);
+          default:
+            $display($time, ": %s Idle  --------------------------", prefix);
+        endcase
+  endfunction: display
+    
+  function apb_trans copy();
+    apb_trans to   = new();
+    to.addr        = this.addr;
+    to.data        = this.data;
+    to.transaction = this.transaction;
+    copy = to;
+  endfunction: copy
+    
+endclass
+
+`endif
+
+////////////////// ENV //////////////
+/***************** test_cfg ******************************************************
+`include "apb_env/apb_trans.sv"
+`include "apb_env/apb_if.sv"
+`include "apb_env/apb_master.sv"
+`include "apb_env/apb_monitor.sv"
+`include "apb_env/apb_gen.sv"
+`include "env/scoreboard.sv"
+class test_cfg;
+
+  // Test terminates when the trans_cnt is greater than max_trans_cnt member
+  rand int trans_cnt;
+
+  constraint basic {
+    (trans_cnt > 0) && (trans_cnt < 100);
+  }
+endclass: test_cfg
+
+
+
+class env;
+
+  // Test configurations
+  test_cfg    tcfg;
+
+  // Transactors
+  apb_gen     gen;
+  apb_master  mst;
+  apb_monitor mon;
+  scoreboard  scb;
+
+  // APB transaction mailbox. Used to pass transaction
+  // from APB gen to APB master, master to scoreboard, and monitor to scoreboard
+  mailbox #(apb_trans) gen2mas, mas2scb, mon2scb;
+
+  virtual apb_if aif;
+
+
+  function new(virtual apb_if aif);
+    this.aif  = aif;
+    gen2mas   = new();
+    mas2scb   = new();
+    mon2scb   = new();
+    tcfg      = new();
+    if (!tcfg.randomize()) 
+      begin
+        $display("test_cfg::randomize failed");
+        $finish;
+      end
+    gen      = new(gen2mas, tcfg.trans_cnt, 1);
+    mst      = new(this.aif, gen2mas, mas2scb, 1);
+    mon      = new(this.aif, mon2scb);
+    scb      = new(tcfg.trans_cnt, mas2scb, mon2scb);
+  endfunction: new
+
+
+  virtual task pre_test();
+    // Make sure the same # of transactions are expected by the scoreboard
+    scb.max_trans_cnt = gen.max_trans_cnt;
+    fork
+      scb.main();
+      mst.main();
+      mon.main();
+    join_none
+  endtask: pre_test
+
+
+  virtual task test();
+    mst.reset();
+    fork
+      gen.main();
+    join_none
+  endtask: test
+
+
+  virtual task post_test();
+    fork
+      wait(gen.ended.triggered);
+      wait(scb.ended.triggered);
+    join
+  endtask: post_test
+
+
+  task run();
+    pre_test();
+    test();
+    post_test();
+  endtask: run
+
+endclass: env
+
+
+/***************** scoreboard **************************************************
+`include "apb_env/apb_trans.sv"
+
+class scoreboard;
+
+  // Verbosity level
+  bit verbose;
+  
+  // Max # of transactions
+  int max_trans_cnt;
+  event ended;
+
+  // Number of good matches
+  int match;
+
+  // Transaction coming in
+  mailbox #(apb_trans) mas2scb, mon2scb;
+    
+
+  // Constructor
+  function new(int max_trans_cnt, mailbox #(apb_trans) mas2scb, mon2scb, bit verbose=0);
+    this.max_trans_cnt = max_trans_cnt;
+    this.mas2scb       = mas2scb;
+    this.mon2scb       = mon2scb; 
+    this.verbose       = verbose;
+  endfunction
+
+
+  // Method to receive transactions from master and monitor
+  task main();
+    apb_trans mas_tr, mon_tr;
+    reg [APB_DATA_WIDTH-1:0] exp_data;
+
+    $display($time, ": Starting scoreboard for %0d transaction", max_trans_cnt);
+
+    forever
+      begin
+
+        // Since this device operates as a transfer function, the self-checking 
+        // mechanism is quite simple. The scoreboard first waits for a
+        // transaction to be generated then waits for the monitor to notify that 
+        // this transaction occurred.  In order to determine the transaction 
+        // correctness the following rules are applied:
+        //   - Each generated WRITE transactions are stored to a register file 
+        //    (which acts as a reference model in this case).
+        //   - Each generated READ transactions get their data field filled from 
+        //     the register file (so to provide an expected result).
+        //   - each transactions is then compared on a first-come first-serve basis.
+        mas2scb.get(mas_tr);
+        mon2scb.get(mon_tr);
+
+        exp_data = $root.top.m1.memory_read(mas_tr.addr);
+
+        // First compare the two transactions: master & monitor
+        if (mas_tr.transaction != mon_tr.transaction)
+          $display("@%0d: ERROR master transaction type (%s) does not match monitor (%s)",
+                   $time, mas_tr.transaction.name, mon_tr.transaction.name);
+        else if (mas_tr.addr != mon_tr.addr)
+          $display("@%0d: ERROR master transaction addr(%h) does not match monitor (%h)",
+                   $time, mas_tr.addr, mon_tr.addr);
+        else begin
+
+          // Okay, now does the transaction match the memory?
+        case(mas_tr.transaction) 
+          WRITE: 
+            begin
+              // Check that master data == monitor data
+              if (mas_tr.data != mon_tr.data)
+                $display("@%0d: ERROR master transaction data(%h) does not match monitor (%h)",
+                         $time, mas_tr.data, mon_tr.data);
+
+              // Okay, the two transactions match, did the right stuf get into memory?
+              else if (mas_tr.data != exp_data)
+                $display("@%0d: ERROR master transaction data(%h) does not match memory (%h)",
+                         $time, mas_tr.data, exp_data);
+              else
+                begin
+                  match++;
+                  if(verbose)
+                    $display("@%0d: Data match Addr=%H Data=%H", $time, mon_tr.addr, mon_tr.data);
+                end
+            end // case: WRITE
+
+          READ:  
+            begin
+              // Okay, the two transactions match, did the right stuf get into memory?
+              if (mon_tr.data != exp_data)
+                $display("@%0d: ERROR monitor transaction data(%h) does not match memory (%h)",
+                         $time, mon_tr.data, exp_data);
+              else
+                begin
+                  match++;
+                  if(verbose)
+                    $display("@%0d: Data match Addr=%H Data=%H", $time, mon_tr.addr, mon_tr.data);
+                end
+            end // case: READ
+
+          default:
+            begin
+              $display("@%0d: Fatal error: Scoreboard received illegal master transaction '%s'", 
+                       $time, mas_tr.transaction.name);
+              $finish;
+            end
+        endcase
+        end // else: !if(mas_tr.addr != mon_tr.addr)
+        
+        // Determine if the end of test has been reached
+        if(--max_trans_cnt<1)
+          ->ended;
+        
+      end // forever
+  endtask
+
+endclass
+
+
+///////////////////////////////////// HDL//////////////////////
+
+/********************** MEMORY **************************************************
+`include "hdl/root.sv"
+
+module mem(apb_if.Slave apb);
+// Memory
+   apb_data_t memory ['h0000:'hffff];
+
+  function apb_data_t memory_read(input apb_addr_t addr);
+    return memory[addr];
+  endfunction
+  
+// Hardware reset
+always
+begin: do_reset
+   integer i;
+   
+   wait (apb.Rst === 1'b0);
+   // Reset the register file
+   //for (i = 'h00; i <= 'hffff; i = i + 1) begin
+   //   memory[i] = 32'h00;
+   //end
+   // Disable all blocks
+   disable mgmt_if;
+
+   wait (apb.Rst !== 1'b0);
+end
+
+
+//
+// Management interface
+//
+
+   // Output driver - must be 4-state for Z-drive
+   reg [APB_DATA_WIDTH-1:0] Data_out;
+   assign apb.PRData = Data_out;
+
+   always
+     begin: mgmt_if
+	Data_out = 'z;
+	
+	// Wait for reset to go away
+	wait (apb.Rst === 1'b1);
+
+	// Normal operation
+	forever begin
+	   
+	   @ (posedge apb.PClk)
+	     if(apb.PSel === 1'b1) begin
+		if (apb.PWrite === 1'b1) begin
+		   // PWriteite cycle
+		   if(apb.PEnable === 1'b0)
+		      @(posedge apb.PEnable)
+		   memory[apb.PAddr] = apb.PWData;
+		end
+		else begin
+		   // Read cycle
+		   if(apb.PEnable === 1'b0)
+		      @(posedge apb.PEnable)
+		   Data_out <= memory[apb.PAddr];
+		end
+	     end
+	end
+     end
+endmodule
+
+*********************ROOT*********************************************************
+parameter APB_ADDR_WIDTH = 16;
+typedef bit [APB_ADDR_WIDTH-1:0] apb_addr_t;
+parameter APB_DATA_WIDTH = 32;
+typedef bit [APB_DATA_WIDTH-1:0] apb_data_t;
+typedef enum {READ, WRITE, IDLE} trans_e;
+
+//endpackage; // package lab2_package
+   
+/********************** TOP ******************************************************
+module top;
+  parameter simulation_cycle = 100;
+  
+  bit clk;
+  always #(simulation_cycle/2) 
+    clk = ~clk;
+
+  apb_if apb(clk); // APB interafce
+  test   t1(apb);  // Testbench program
+  mem    m1(apb);  // Memory device
+
+endmodule  
+
+
+
